@@ -1,0 +1,25 @@
+{
+  "name": "Esp32-simple-radio",
+  "keywords": "ESP32, radio, Robotarna, RobotikaBrno, RoboticsBrno",
+  "description": "Library that provides very simple radio transmission via BLE GAP, inspired by micro:bit's radio.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RoboticsBrno/Esp32-simple-radio.git"
+  },
+  "authors": [
+    {
+      "name": "Vojtěch Boček",
+      "email": "vbocek@gmail.com",
+      "url": "http://www.robotikabrno.cz",
+      "maintainer": true
+    }
+  ],
+  "version": "1.0.0",
+  "frameworks": ["espidf", "arduino"],
+  "platforms": "espressif32",
+  "build": {
+    "flags": "-std=gnu++14",
+    "unflags": "-std=gnu++11"
+  }
+}
