@@ -1,20 +1,26 @@
 #pragma once
 
 #include "esp_gap_ble_api.h"
+#include <cstring>
 #include <esp_err.h>
 #include <functional>
 #include <mutex>
 
-struct MessageWrapper {
-    uint8_t data[30];
-    uint8_t data_len;
+enum PacketDataType : uint8_t {
+    String = 0,
+    Number = 1, // double
+    KeyValue = 2, // string key, double value
+};
+
+struct PacketInfo {
     uint8_t group;
     esp_bd_addr_t addr;
     int16_t rssi; // signal strength, higher == better
-    bool repeated;
 };
 
-typedef std::function<void(MessageWrapper)> MessageCallbackT;
+typedef std::function<void(std::string, PacketInfo)> PacketStringCallbackT;
+typedef std::function<void(double, PacketInfo)> PacketNumberCallbackT;
+typedef std::function<void(std::string, double, PacketInfo)> PacketKeyValueCallbackT;
 
 class SimpleRadioImpl {
 public:
@@ -37,26 +43,78 @@ public:
     esp_err_t begin(uint8_t group = 0, const SimpleRadioImpl::Config& config = DEFAULT_CONFIG);
     void end();
 
-    // group in range <0,64)
+    // group in range <0,16)
     void setGroup(uint8_t group);
 
     // len must be <= 30
-    void setData(const uint8_t *data, size_t len);
+    void setData(PacketDataType dtype, const uint8_t* data, size_t len);
 
-    void setOnMessageCallback(MessageCallbackT callback) {
+    void sendString(const char* str) {
+        setData(PacketDataType::String, (const uint8_t*)str, strlen(str));
+    }
+    void sendString(const std::string& str) {
+        setData(PacketDataType::String, (const uint8_t*)str.c_str(), str.size());
+    }
+
+    void sendNumber(double number) {
+        setData(PacketDataType::Number, (const uint8_t*)&number, sizeof(double));
+    }
+
+    void sendKeyValue(const std::string& key, double value) {
+        char buf[30];
+        auto key_len = std::min(sizeof(buf) - 8, key.size());
+        memcpy(buf, (void*)&value, 8);
+        memcpy(buf + 8, (void*)key.c_str(), key_len);
+        setData(PacketDataType::KeyValue, (const uint8_t*)buf, key_len + 8);
+    }
+
+    // Ignore re-transmitted messages with same content, call OnMessageCallback only when data changes.
+    // Default true.
+    void setIgnoreRepeatedMessages(bool ignore) {
         m_mutex.lock();
-        m_msg_callback = callback;
+        m_ignore_repeated_messages = ignore;
+        m_mutex.unlock();
+    }
+
+    void setOnStringCallback(PacketStringCallbackT cb) {
+        m_mutex.lock();
+        m_cb_string = cb;
+        m_mutex.unlock();
+    }
+
+    void setOnNumberCallback(PacketNumberCallbackT cb) {
+        m_mutex.lock();
+        m_cb_number = cb;
+        m_mutex.unlock();
+    }
+
+    void setOnKeyValueCallback(PacketKeyValueCallbackT cb) {
+        m_mutex.lock();
+        m_cb_keyvalue = cb;
         m_mutex.unlock();
     }
 
 private:
-    static void gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+    static void gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param);
+
+    std::function<void(PacketInfo)> prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len);
 
     bool m_initialized;
+    bool m_ignore_repeated_messages;
+    bool m_is_advertising;
+
     uint8_t m_data[31];
-    size_t m_data_size;
+    uint8_t m_data_size;
+
+    uint8_t m_last_incomming[31];
+    uint8_t m_last_incomming_len;
+
     Config m_used_config;
-    MessageCallbackT m_msg_callback;
+
+    PacketStringCallbackT m_cb_string;
+    PacketNumberCallbackT m_cb_number;
+    PacketKeyValueCallbackT m_cb_keyvalue;
+
     mutable std::mutex m_mutex;
 };
 
