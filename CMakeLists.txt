@@ -7,5 +7,5 @@ set(SRCS
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS "./src"
-    REQUIRES bt
+    REQUIRES bt nvs_flash
 )
