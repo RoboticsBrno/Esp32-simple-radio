@@ -46,6 +46,11 @@ public:
     // group in range <0,16)
     void setGroup(uint8_t group);
 
+    uint8_t group() const;
+
+    // Returns local address others see this device as. Works only after begin() is called.
+    esp_err_t address(esp_bd_addr_t out_address) const;
+
     // len must be <= 30
     void setData(PacketDataType dtype, const uint8_t* data, size_t len);
 
