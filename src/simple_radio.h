@@ -1,6 +1,10 @@
 #pragma once
 
 #include "esp_gap_ble_api.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+
+#include <atomic>
 #include <cstring>
 #include <esp_err.h>
 #include <functional>
@@ -32,6 +36,33 @@ public:
         // Only works if init_bt_controller == true.
         bool release_bt_memory;
         bool init_bluedroid;
+
+        // Stop advertising message after N ms, so that it won't be received by others
+        // long after it was "sent".
+        // Set to 0 to disable.
+        // Default: 1000 ms
+        uint16_t message_timeout_ms;
+
+        /*!< Minimum advertising interval, "how often" is message transmitted
+            Range: 0x0020 to 0x4000 Default: N = 0x0020 (12.5 ms)
+            Time = N * 0.625 msec Time Range: 20 ms to 10.24 sec */
+        uint16_t adv_int_min;
+        /*!< Maximum advertising interval "how often" is message transmitted
+            Range: 0x0020 to 0x4000 Default: N = 0x0040 (25 ms)
+            Time = N * 0.625 msec Time Range: 20 ms to 10.24 sec Advertising max interval */
+        uint16_t adv_int_max;
+
+        /*!< Scan interval, "how often" to scan for new messages.
+             Range: 0x0004 to 0x4000 Default: 0x0010 (10 ms)
+             Time = N * 0.625 msec
+             Time Range: 2.5 msec to 10.24 seconds*/
+        uint16_t scan_interval;
+        /*!< Scan window. The duration of the LE scan. LE_Scan_Window
+             shall be less than or equal to LE_Scan_Interval
+             Range: 0x0004 to 0x4000 Default: 0x0010 (10 ms)
+             Time = N * 0.625 msec
+             Time Range: 2.5 msec to 10240 msec */
+        uint16_t scan_window;
     };
 
     static const Config DEFAULT_CONFIG;
@@ -101,10 +132,13 @@ public:
 
 private:
     static void gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param);
+    static void onTimeout(TimerHandle_t timer);
+
+    void submitAdvertisingData();
 
     std::function<void(PacketInfo)> prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len);
 
-    bool m_initialized;
+    std::atomic<bool> m_initialized;
     bool m_ignore_repeated_messages;
     bool m_is_advertising;
 
@@ -119,6 +153,8 @@ private:
     PacketStringCallbackT m_cb_string;
     PacketNumberCallbackT m_cb_number;
     PacketKeyValueCallbackT m_cb_keyvalue;
+
+    TimerHandle_t m_timeout_timer;
 
     mutable std::mutex m_mutex;
 };
