@@ -375,6 +375,15 @@ void SimpleRadioImpl::setGroup(uint8_t group) {
     }
 }
 
+uint8_t SimpleRadioImpl::group() const {
+    return m_data[0] & 0x0F;
+}
+
+esp_err_t SimpleRadioImpl::address(esp_bd_addr_t out_address) const {
+    uint8_t addr_type;
+    return esp_ble_gap_get_local_used_addr(out_address, &addr_type);
+}
+
 void SimpleRadioImpl::setData(PacketDataType dtype, const uint8_t* data, size_t len) {
     if (len == 0) {
         m_data_size = 0;
