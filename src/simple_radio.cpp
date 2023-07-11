@@ -32,12 +32,11 @@ const SimpleRadioImpl::Config SimpleRadioImpl::DEFAULT_CONFIG = {
 
 SimpleRadioImpl::SimpleRadioImpl() {
     m_ignore_repeated_messages = true;
+    m_initialized = false;
     m_is_advertising = false;
-    m_last_incomming_len
-        = 0;
+    m_last_incomming_len = 0;
     m_data_size = 0;
-    m_data[0]
-        = SIMPLERADIO_BLE_ADV_PROP_TYPE;
+    m_data[0] = SIMPLERADIO_BLE_ADV_PROP_TYPE;
 }
 
 SimpleRadioImpl::~SimpleRadioImpl() {
@@ -172,8 +171,6 @@ void SimpleRadioImpl::end() {
         ESP_LOGW(TAG, "esp_ble_gap_stop_scanning error, error code = %x", ret);
     }
 
-    m_is_advertising = false;
-
     ret = esp_ble_gap_stop_advertising();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "esp_ble_gap_stop_advertising error, error code = %x", ret);
@@ -202,6 +199,16 @@ void SimpleRadioImpl::end() {
             ESP_LOGW(TAG, "esp_bt_controller_deinit error, error code = %x", ret);
         }
     }
+
+    m_mutex.lock();
+    m_is_advertising = false;
+    m_initialized = false;
+    m_cb_string = nullptr;
+    m_cb_number = nullptr;
+    m_cb_keyvalue = nullptr;
+    m_last_incomming_len = 0;
+    m_data_size = 0;
+    m_mutex.unlock();
 }
 
 void SimpleRadioImpl::gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
