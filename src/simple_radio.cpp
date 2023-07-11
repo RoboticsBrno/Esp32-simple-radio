@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "nvs_flash.h"
 
 #include "esp_bt_defs.h"
@@ -28,6 +29,11 @@ const SimpleRadioImpl::Config SimpleRadioImpl::DEFAULT_CONFIG = {
     .init_bt_controller = true,
     .release_bt_memory = true,
     .init_bluedroid = true,
+    .message_timeout_ms = 1000,
+    .adv_int_min = 0x0020,
+    .adv_int_max = 0x0040,
+    .scan_interval = 0,
+    .scan_window = 0,
 };
 
 SimpleRadioImpl::SimpleRadioImpl() {
@@ -37,6 +43,7 @@ SimpleRadioImpl::SimpleRadioImpl() {
     m_last_incomming_len = 0;
     m_data_size = 0;
     m_data[0] = SIMPLERADIO_BLE_ADV_PROP_TYPE;
+    m_timeout_timer = nullptr;
 }
 
 SimpleRadioImpl::~SimpleRadioImpl() {
@@ -126,6 +133,8 @@ esp_err_t SimpleRadioImpl::begin(uint8_t group, const SimpleRadioImpl::Config& c
 
     scan_params.scan_type = BLE_SCAN_TYPE_PASSIVE;
     scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE;
+    scan_params.scan_window = config.scan_window;
+    scan_params.scan_interval = config.scan_interval;
 
     ret = esp_ble_gap_set_scan_params(&scan_params);
     if (ret != ESP_OK) {
@@ -136,12 +145,11 @@ esp_err_t SimpleRadioImpl::begin(uint8_t group, const SimpleRadioImpl::Config& c
     setGroup(group);
     m_initialized = true;
 
-    if (m_data_size > 0) {
-        esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(m_data, m_data_size);
-        if (raw_adv_ret) {
-            ESP_LOGE(TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
-        }
+    if (config.message_timeout_ms) {
+        m_timeout_timer = xTimerCreate("sradio_timeout", pdMS_TO_TICKS(config.message_timeout_ms), pdFALSE, nullptr, onTimeout);
     }
+
+    submitAdvertisingData();
 
     return ESP_OK;
 
@@ -208,6 +216,12 @@ void SimpleRadioImpl::end() {
     m_cb_keyvalue = nullptr;
     m_last_incomming_len = 0;
     m_data_size = 0;
+
+    if (m_timeout_timer) {
+        xTimerDelete(m_timeout_timer, 0);
+        m_timeout_timer = nullptr;
+    }
+
     m_mutex.unlock();
 }
 
@@ -216,13 +230,19 @@ void SimpleRadioImpl::gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_
 
     switch (event) {
     case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT: {
+        std::lock_guard<std::mutex> l(self.m_mutex);
+
+        if (self.m_timeout_timer) {
+            xTimerReset(self.m_timeout_timer, 0);
+        }
+
         if (self.m_is_advertising) {
             break;
         }
 
         static esp_ble_adv_params_t adv_params = {
-            .adv_int_min = 0x020,
-            .adv_int_max = 0x040,
+            .adv_int_min = self.m_used_config.adv_int_min,
+            .adv_int_max = self.m_used_config.adv_int_max,
             .adv_type = ADV_TYPE_NONCONN_IND,
             .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
             .peer_addr = {},
@@ -233,7 +253,7 @@ void SimpleRadioImpl::gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_
 
         auto ret = esp_ble_gap_start_advertising(&adv_params);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "gap start scanning error, error code = %x", ret);
+            ESP_LOGE(TAG, "gap esp_ble_gap_start_advertising error, error code = %x", ret);
             break;
         }
 
@@ -309,6 +329,20 @@ void SimpleRadioImpl::gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_
     }
 }
 
+void SimpleRadioImpl::onTimeout(TimerHandle_t timer) {
+    auto& self = SimpleRadio;
+
+    self.m_mutex.lock();
+    if (self.m_is_advertising) {
+        self.m_is_advertising = false;
+        auto err = esp_ble_gap_stop_advertising();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to stop advertising due tu timeout: %x", err);
+        }
+    }
+    self.m_mutex.unlock();
+}
+
 std::function<void(PacketInfo)> SimpleRadioImpl::prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len) {
     using namespace std::placeholders;
 
@@ -366,13 +400,7 @@ void SimpleRadioImpl::setGroup(uint8_t group) {
     }
 
     m_data[0] = (m_data[0] & 0xF0) | group;
-
-    if (m_initialized && m_data_size > 0) {
-        esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(m_data, m_data_size);
-        if (raw_adv_ret) {
-            ESP_LOGE(TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
-        }
-    }
+    submitAdvertisingData();
 }
 
 uint8_t SimpleRadioImpl::group() const {
@@ -400,10 +428,18 @@ void SimpleRadioImpl::setData(PacketDataType dtype, const uint8_t* data, size_t 
     memcpy(m_data + 1, data, len);
     m_data_size = len + 1;
 
-    if (m_initialized) {
-        esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(m_data, m_data_size);
-        if (raw_adv_ret) {
-            ESP_LOGE(TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
-        }
+    submitAdvertisingData();
+}
+
+void SimpleRadioImpl::submitAdvertisingData() {
+    if (!m_initialized || m_data_size == 0) {
+        return;
     }
+
+    m_mutex.lock();
+    esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(m_data, m_data_size);
+    if (raw_adv_ret) {
+        ESP_LOGE(TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
+    }
+    m_mutex.unlock();
 }
