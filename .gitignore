@@ -39,3 +39,6 @@
 
 # Doxygen export
 doc
+.pio
+.vscode
+platformio.ini

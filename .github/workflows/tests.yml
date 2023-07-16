@@ -13,6 +13,8 @@ jobs:
           - esp32-idf3-arduino.ini
           - esp32-idf4-arduino.ini
           #- esp32-idf5-idf.ini
+          - esp32c3-idf4-arduino.ini
+          #- esp32c3-idf5-idf.ini
           - esp32s3-idf4-arduino.ini
           #- esp32s3-idf5-idf.ini
     steps:

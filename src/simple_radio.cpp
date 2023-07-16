@@ -94,7 +94,7 @@ esp_err_t SimpleRadioImpl::begin(uint8_t group, const SimpleRadioImpl::Config& c
         }
 
         esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-#ifndef CONFIG_IDF_TARGET_ESP32S3
+#if !defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(CONFIG_IDF_TARGET_ESP32C3)
         bt_cfg.mode = ESP_BT_MODE_BLE;
 #else
         bt_cfg.bluetooth_mode = ESP_BT_MODE_BLE;
