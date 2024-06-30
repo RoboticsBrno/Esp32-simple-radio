@@ -5,10 +5,12 @@
 #include "freertos/timers.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <esp_err.h>
 #include <functional>
 #include <mutex>
+#include <string>
 
 enum PacketDataType : uint8_t {
     String = 0,
