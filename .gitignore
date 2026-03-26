@@ -42,3 +42,7 @@ doc
 .pio
 .vscode
 platformio.ini
+test_apps/**/build/
+test_apps/**/dependencies.lock
+test_apps/**/sdkconfig
+test_apps/**/sdkconfig.old
