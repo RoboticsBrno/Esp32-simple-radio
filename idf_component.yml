@@ -1,0 +1,17 @@
+version: "2.0.0"
+description: "Simple ESP-NOW broadcast radio for ESP32, inspired by micro:bit radio."
+url: "https://github.com/RoboticsBrno/Esp32-simple-radio"
+repository: "https://github.com/RoboticsBrno/Esp32-simple-radio.git"
+license: "MIT"
+maintainers:
+  - "Vojtech Bocek <vbocek@gmail.com>"
+tags:
+  - esp32
+  - esp-now
+  - radio
+  - networking
+dependencies:
+  idf:
+    version: ">=5.0"
+examples:
+  - path: "test_apps/esp_now_broadcast"

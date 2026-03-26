@@ -10,6 +10,7 @@ static void delay(int ms) {
 
 #include "simple_radio.h"
 #include <cstring>
+#include <span>
 
 void setup() {
     SimpleRadio.begin(0);
@@ -24,9 +25,16 @@ void setup() {
         printf("Got kv %s = %f rssi %d\n", key.c_str(), val, info.rssi);
     });
 
+    SimpleRadio.setOnBlobCallback([](std::span<const uint8_t> blob, PacketInfo info) {
+        printf("Got blob len=%u rssi %d from %02x:%02x:%02x:%02x:%02x:%02x\n",
+            static_cast<unsigned>(blob.size()),
+            info.rssi,
+            info.addr[0], info.addr[1], info.addr[2], info.addr[3], info.addr[4], info.addr[5]);
+    });
+
     char buf[32];
     for (size_t i = 0; true; ++i) {
-        switch (i % 3) {
+        switch (i % 4) {
         case 0: {
             snprintf(buf, sizeof(buf), "iter %d", i);
             SimpleRadio.sendString(buf);
@@ -38,6 +46,11 @@ void setup() {
         }
         case 2: {
             SimpleRadio.sendKeyValue("num", i);
+            break;
+        }
+        case 3: {
+            const uint8_t blob[] = {0xde, 0xad, 0xbe, 0xef, static_cast<uint8_t>(i)};
+            SimpleRadio.sendBlob(blob, sizeof(blob));
             break;
         }
         }

@@ -1,52 +1,210 @@
-#include <cstring>
+#include "simple_radio.h"
 
-#include "esp_bt.h"
+#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_system.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
-#include "freertos/task.h"
-#include "freertos/timers.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
 #include "nvs_flash.h"
 
-#include "esp_bt_defs.h"
-#include "esp_bt_main.h"
-#include "esp_gap_ble_api.h"
-
-#include "simple_radio.h"
+#include <algorithm>
+#include <cstring>
 
 #define TAG "SimpleRadio"
 
-// esp_ble_gap_register_callback does not allow to pass a user argument,
-// and we need to be able to access the SimpleRadioImpl instance from
-// the event callback. We need to have a SimpleRadio singleton, arduino-style for this.
-SimpleRadioImpl SimpleRadio;
+namespace {
 
-static constexpr const uint8_t SIMPLERADIO_BLE_ADV_PROP_TYPE = 0x80;
+const uint8_t kBroadcastAddress[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+constexpr uint8_t kMagic0 = 'S';
+constexpr uint8_t kMagic1 = 'R';
+constexpr size_t kHeaderSize = 6;
+constexpr size_t kMaxPayloadSize = 1490;
+
+struct DecodedPacket {
+    uint8_t group = 0;
+    PacketDataType type = PacketDataType::String;
+    const uint8_t* payload = nullptr;
+    size_t payload_len = 0;
+};
+
+size_t encodePacket(PacketDataType type, uint8_t group, const uint8_t* payload, size_t payload_len, uint8_t* out, size_t out_size) {
+    if (out == nullptr || out_size < kHeaderSize ||
+        payload_len > kMaxPayloadSize ||
+        kHeaderSize + payload_len > out_size) {
+        return 0;
+    }
+    if (payload_len > 0 && payload == nullptr) {
+        return 0;
+    }
+
+    out[0] = kMagic0;
+    out[1] = kMagic1;
+    out[2] = group;
+    out[3] = static_cast<uint8_t>(type);
+    out[4] = static_cast<uint8_t>(payload_len & 0xFF);
+    out[5] = static_cast<uint8_t>((payload_len >> 8) & 0xFF);
+
+    if (payload_len > 0) {
+        std::memcpy(out + kHeaderSize, payload, payload_len);
+    }
+
+    return kHeaderSize + payload_len;
+}
+
+bool decodePacket(const uint8_t* packet, size_t packet_len, DecodedPacket& out) {
+    if (packet == nullptr || packet_len < kHeaderSize) {
+        return false;
+    }
+    if (packet[0] != kMagic0 || packet[1] != kMagic1) {
+        return false;
+    }
+
+    const size_t payload_len = static_cast<size_t>(packet[4]) | (static_cast<size_t>(packet[5]) << 8);
+    if (packet_len != kHeaderSize + payload_len) {
+        return false;
+    }
+
+    const auto type = static_cast<PacketDataType>(packet[3]);
+    if (type > PacketDataType::Blob) {
+        return false;
+    }
+
+    out.group = packet[2];
+    out.type = type;
+    out.payload = packet + kHeaderSize;
+    out.payload_len = payload_len;
+    return true;
+}
+
+PacketInfo makePacketInfo(const uint8_t* addr, uint8_t group, int16_t rssi) {
+    PacketInfo info = {};
+    info.group = group;
+    if (addr != nullptr) {
+        std::memcpy(info.addr, addr, sizeof(info.addr));
+    }
+    info.rssi = rssi;
+    return info;
+}
+
+} // namespace
+
+SimpleRadioImpl SimpleRadio;
 
 const SimpleRadioImpl::Config SimpleRadioImpl::DEFAULT_CONFIG = {
     .init_nvs = true,
-    .init_bt_controller = true,
-    .release_bt_memory = true,
-    .init_bluedroid = true,
-    .message_timeout_ms = 1000,
-    .adv_int_min = 0x0020,
-    .adv_int_max = 0x0040,
-    .scan_interval = 0,
-    .scan_window = 0,
+    .init_netif = true,
+    .init_event_loop = true,
+    .init_wifi = true,
+    .init_esp_now = true,
+    .channel = 1,
 };
 
-SimpleRadioImpl::SimpleRadioImpl() {
-    m_ignore_repeated_messages = true;
-    m_initialized = false;
-    m_is_advertising = false;
-    m_last_incomming_len = 0;
-    m_data_size = 0;
-    m_data[0] = SIMPLERADIO_BLE_ADV_PROP_TYPE;
-    m_timeout_timer = nullptr;
+SimpleRadioImpl::SimpleRadioImpl()
+    : m_initialized(false),
+      m_ignore_repeated_messages(true),
+      m_group(0),
+      m_tx_buffer(kMaxPacketSize, 0),
+      m_last_incoming_addr({0, 0, 0, 0, 0, 0}) {
 }
 
 SimpleRadioImpl::~SimpleRadioImpl() {
+}
+
+esp_err_t SimpleRadioImpl::initNvsIfNeeded(const Config& config) {
+    if (!config.init_nvs) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    if (ret == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    return ret;
+}
+
+esp_err_t SimpleRadioImpl::initWifiIfNeeded(const Config& config) {
+    if (config.init_netif) {
+        esp_err_t ret = esp_netif_init();
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            return ret;
+        }
+    }
+
+    if (config.init_event_loop) {
+        esp_err_t ret = esp_event_loop_create_default();
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            return ret;
+        }
+    }
+
+    if (!config.init_wifi) {
+        return ESP_OK;
+    }
+
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t ret = esp_wifi_init(&wifi_cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
+
+    ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_wifi_start();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+        return ret;
+    }
+
+    ret = esp_wifi_set_channel(config.channel, WIFI_SECOND_CHAN_NONE);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t SimpleRadioImpl::initEspNowIfNeeded(const Config& config) {
+    if (!config.init_esp_now) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = esp_now_init();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_now_register_recv_cb(onDataReceived);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_now_register_send_cb(onDataSent);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    esp_now_peer_info_t peer = {};
+    std::memcpy(peer.peer_addr, kBroadcastAddress, sizeof(peer.peer_addr));
+    peer.ifidx = WIFI_IF_STA;
+    peer.channel = config.channel;
+    peer.encrypt = false;
+
+    ret = esp_now_add_peer(&peer);
+    if (ret == ESP_ERR_ESPNOW_EXIST) {
+        return ESP_OK;
+    }
+    return ret;
 }
 
 esp_err_t SimpleRadioImpl::begin(uint8_t group, const SimpleRadioImpl::Config& config) {
@@ -55,117 +213,39 @@ esp_err_t SimpleRadioImpl::begin(uint8_t group, const SimpleRadioImpl::Config& c
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (group >= 16) {
-        ESP_LOGE(TAG, "The group id must be in range <0;16)");
-        return ESP_ERR_INVALID_ARG;
-    }
-
     m_used_config = config;
+    m_group = group;
 
-    esp_err_t ret = ESP_OK;
-    esp_ble_scan_params_t scan_params = {};
-
-    if (config.init_nvs) {
-        ret = nvs_flash_init();
-        if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-            ESP_ERROR_CHECK(nvs_flash_erase());
-            ret = nvs_flash_erase();
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "%s failed to erase nvs flash: %s", __func__, esp_err_to_name(ret));
-                return ret;
-            }
-            ret = nvs_flash_init();
-        }
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "%s failed to init nvs flash: %s", __func__, esp_err_to_name(ret));
-            return ret;
-        }
-    }
-
-    if (config.init_bt_controller) {
-        if (config.release_bt_memory) {
-            // Releases memory of the classic, non-BLE bluetooth stack
-            // because we don't use it, to free up RAM. It cannot be reversed.
-            ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "%s failed to release bt controller memory: %s", __func__, esp_err_to_name(ret));
-                return ret;
-            }
-        }
-
-        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-#if !defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(CONFIG_IDF_TARGET_ESP32C3)
-        bt_cfg.mode = ESP_BT_MODE_BLE;
-#else
-        bt_cfg.bluetooth_mode = ESP_BT_MODE_BLE;
-#endif
-        ret = esp_bt_controller_init(&bt_cfg);
-        if (ret) {
-            ESP_LOGE(TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(ret));
-            return ret;
-        }
-
-        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-        if (ret) {
-            ESP_LOGE(TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
-            goto exit_bt_deinit;
-        }
-    }
-
-    if (config.init_bluedroid) {
-        ret = esp_bluedroid_init();
-        if (ret) {
-            ESP_LOGE(TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
-            goto exit_bt_disable;
-        }
-        ret = esp_bluedroid_enable();
-        if (ret) {
-            ESP_LOGE(TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
-            goto exit_bluedroid_deinit;
-        }
-    }
-
-    ret = esp_ble_gap_register_callback(gapEventHandler);
-    if (ret) {
-        ESP_LOGE(TAG, "gap register error, error code = %x", ret);
-        goto exit_bluedroid_disable;
-    }
-
-    scan_params.scan_type = BLE_SCAN_TYPE_PASSIVE;
-    scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE;
-    scan_params.scan_window = config.scan_window;
-    scan_params.scan_interval = config.scan_interval;
-
-    ret = esp_ble_gap_set_scan_params(&scan_params);
+    esp_err_t ret = initNvsIfNeeded(config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "gap set scan params error, error code = %x", ret);
-        goto exit_bluedroid_disable;
+        ESP_LOGE(TAG, "%s failed to init nvs flash: %s", __func__, esp_err_to_name(ret));
+        return ret;
     }
 
-    setGroup(group);
+    ret = initWifiIfNeeded(config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s failed to init Wi-Fi: %s", __func__, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = initEspNowIfNeeded(config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s failed to init ESP-NOW: %s", __func__, esp_err_to_name(ret));
+        if (config.init_wifi) {
+            esp_wifi_stop();
+            esp_wifi_deinit();
+        }
+        return ret;
+    }
+
+    uint32_t version = 0;
+    ret = esp_now_get_version(&version);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "ESP-NOW version %lu", static_cast<unsigned long>(version));
+    }
+
     m_initialized = true;
-
-    if (config.message_timeout_ms) {
-        m_timeout_timer = xTimerCreate("sradio_timeout", pdMS_TO_TICKS(config.message_timeout_ms), pdFALSE, nullptr, onTimeout);
-    }
-
-    submitAdvertisingData();
-
     return ESP_OK;
-
-exit_bluedroid_disable:
-    if (config.init_bluedroid)
-        esp_bluedroid_disable();
-exit_bluedroid_deinit:
-    if (config.init_bluedroid)
-        esp_bluedroid_deinit();
-exit_bt_disable:
-    if (config.init_bt_controller)
-        esp_bt_controller_disable();
-exit_bt_deinit:
-    if (config.init_bt_controller)
-        esp_bt_controller_deinit();
-    return ret;
 }
 
 void SimpleRadioImpl::end() {
@@ -174,272 +254,188 @@ void SimpleRadioImpl::end() {
         return;
     }
 
-    esp_err_t ret = esp_ble_gap_stop_scanning();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "esp_ble_gap_stop_scanning error, error code = %x", ret);
+    if (m_used_config.init_esp_now) {
+        esp_now_del_peer(kBroadcastAddress);
+        esp_now_unregister_recv_cb();
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
     }
 
-    ret = esp_ble_gap_stop_advertising();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "esp_ble_gap_stop_advertising error, error code = %x", ret);
+    if (m_used_config.init_wifi) {
+        esp_wifi_stop();
+        esp_wifi_deinit();
     }
 
-    if (m_used_config.init_bluedroid) {
-        ret = esp_bluedroid_disable();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "esp_bluedroid_disable error, error code = %x", ret);
-        }
-
-        ret = esp_bluedroid_deinit();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "esp_bluedroid_deinit error, error code = %x", ret);
-        }
-    }
-
-    if (m_used_config.init_bt_controller) {
-        ret = esp_bt_controller_disable();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "esp_bt_controller_disable error, error code = %x", ret);
-        }
-
-        ret = esp_bt_controller_deinit();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "esp_bt_controller_deinit error, error code = %x", ret);
-        }
-    }
-
-    m_mutex.lock();
-    m_is_advertising = false;
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_initialized = false;
+    m_group = 0;
     m_cb_string = nullptr;
     m_cb_number = nullptr;
     m_cb_keyvalue = nullptr;
-    m_last_incomming_len = 0;
-    m_data_size = 0;
-
-    if (m_timeout_timer) {
-        xTimerDelete(m_timeout_timer, 0);
-        m_timeout_timer = nullptr;
-    }
-
-    m_mutex.unlock();
+    m_cb_blob = nullptr;
+    m_last_incoming_packet.clear();
+    std::fill(m_last_incoming_addr.begin(), m_last_incoming_addr.end(), 0);
 }
 
-void SimpleRadioImpl::gapEventHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
-    auto& self = SimpleRadio;
+void SimpleRadioImpl::setGroup(uint8_t group) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_group = group;
+}
 
-    switch (event) {
-    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT: {
-        std::lock_guard<std::mutex> l(self.m_mutex);
+uint8_t SimpleRadioImpl::group() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_group;
+}
 
-        if (self.m_timeout_timer) {
-            xTimerReset(self.m_timeout_timer, 0);
-        }
+esp_err_t SimpleRadioImpl::address(simple_radio_addr_t out_address) const {
+    return esp_wifi_get_mac(WIFI_IF_STA, out_address);
+}
 
-        if (self.m_is_advertising) {
-            break;
-        }
-
-        static esp_ble_adv_params_t adv_params = {
-            .adv_int_min = self.m_used_config.adv_int_min,
-            .adv_int_max = self.m_used_config.adv_int_max,
-            .adv_type = ADV_TYPE_NONCONN_IND,
-            .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
-            .peer_addr = {},
-            .peer_addr_type = BLE_ADDR_TYPE_PUBLIC,
-            .channel_map = ADV_CHNL_ALL,
-            .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-        };
-
-        auto ret = esp_ble_gap_start_advertising(&adv_params);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "gap esp_ble_gap_start_advertising error, error code = %x", ret);
-            break;
-        }
-
-        self.m_is_advertising = true;
-        break;
+void SimpleRadioImpl::setData(PacketDataType dtype, const uint8_t* data, size_t len) {
+    if (!m_initialized) {
+        ESP_LOGE(TAG, "SimpleRadio is not initialized");
+        return;
     }
-    case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: {
-        auto ret = esp_ble_gap_start_scanning(0);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "gap start scanning error, error code = %x", ret);
+
+    esp_err_t ret = ESP_OK;
+    size_t packet_len = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        packet_len = encodePacket(dtype, m_group, data, len, m_tx_buffer.data(), m_tx_buffer.size());
+        if (packet_len != 0) {
+            ret = esp_now_send(kBroadcastAddress, m_tx_buffer.data(), packet_len);
         }
-        break;
     }
-    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGE(TAG, "Advertising start failed");
-        }
-        break;
-    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-        if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGE(TAG, "Advertising stop failed");
-        }
-        break;
-    case ESP_GAP_BLE_SCAN_RESULT_EVT: {
-        const auto& d = param->scan_rst;
-        if (d.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) {
-            break;
-        }
 
-        if (d.adv_data_len == 0) {
-            break;
-        }
-
-        // check if data stars with our type in top 2 bits
-        if ((d.ble_adv[0] & 0xC0) != SIMPLERADIO_BLE_ADV_PROP_TYPE) {
-            break;
-        }
-
-        // check if in same group
-        if ((d.ble_adv[0] & 0x0F) != (self.m_data[0] & 0x0F)) {
-            break;
-        }
-
-        const uint8_t* data = d.ble_adv + 1;
-        const size_t data_len = d.adv_data_len - 1;
-
-        const auto data_type = (PacketDataType)((d.ble_adv[0] >> 4) & 0x03);
-
-        self.m_mutex.lock();
-        if (self.m_ignore_repeated_messages) {
-            if (self.m_last_incomming_len == d.adv_data_len && memcmp(d.ble_adv, self.m_last_incomming, d.adv_data_len) == 0) {
-                self.m_mutex.unlock();
-                break;
-            }
-            memcpy(self.m_last_incomming, d.ble_adv, d.adv_data_len);
-            self.m_last_incomming_len = d.adv_data_len;
-        }
-
-        auto callback = self.prepareCallbackLocked(data_type, data, data_len);
-        self.m_mutex.unlock();
-
-        if (callback) {
-            PacketInfo info;
-            info.group = d.ble_adv[0] & 0x0F;
-            memcpy(info.addr, d.bda, sizeof(info.addr));
-            info.rssi = d.rssi;
-            callback(info);
-        }
-        break;
+    if (packet_len == 0) {
+        ESP_LOGE(TAG, "failed to encode outgoing packet type=%u len=%u", static_cast<unsigned>(dtype), static_cast<unsigned>(len));
+        return;
     }
-    default:
-        break;
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_send failed: %s", esp_err_to_name(ret));
     }
 }
 
-void SimpleRadioImpl::onTimeout(TimerHandle_t timer) {
-    auto& self = SimpleRadio;
-
-    self.m_mutex.lock();
-    if (self.m_is_advertising) {
-        self.m_is_advertising = false;
-        auto err = esp_ble_gap_stop_advertising();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "failed to stop advertising due tu timeout: %x", err);
-        }
+void SimpleRadioImpl::onDataSent(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        return;
     }
-    self.m_mutex.unlock();
+
+    if (tx_info == nullptr || tx_info->des_addr == nullptr) {
+        ESP_LOGW(TAG, "ESP-NOW send failed");
+        return;
+    }
+
+    ESP_LOGW(TAG, "ESP-NOW send failed to %02x:%02x:%02x:%02x:%02x:%02x",
+        tx_info->des_addr[0], tx_info->des_addr[1], tx_info->des_addr[2],
+        tx_info->des_addr[3], tx_info->des_addr[4], tx_info->des_addr[5]);
 }
 
-std::function<void(PacketInfo)> SimpleRadioImpl::prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len) {
+SimpleRadioImpl::PendingCallback SimpleRadioImpl::prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len) {
     using namespace std::placeholders;
+
+    PendingCallback pending = {};
 
     switch (dtype) {
     case PacketDataType::String: {
         if (!m_cb_string) {
-            return std::function<void(PacketInfo)>();
+            return pending;
         }
-        std::string str((const char*)data, len);
-        return std::bind(m_cb_string, str, _1);
+
+        std::string str(reinterpret_cast<const char*>(data), len);
+        pending.callback = std::bind(m_cb_string, str, _1);
+        pending.valid = true;
+        return pending;
     }
     case PacketDataType::Number: {
         if (!m_cb_number) {
-            return std::function<void(PacketInfo)>();
+            return pending;
         }
 
-        if (len != 8) {
-            ESP_LOGE(TAG, "invalid number packet received, got len %d instead of 8", len);
-            return std::function<void(PacketInfo)>();
+        if (len != sizeof(double)) {
+            ESP_LOGE(TAG, "invalid number packet received, got len %u instead of %u",
+                static_cast<unsigned>(len), static_cast<unsigned>(sizeof(double)));
+            return pending;
         }
 
-        double val = *((double*)data);
-        return std::bind(m_cb_number, val, _1);
+        double value = 0;
+        std::memcpy(&value, data, sizeof(value));
+        pending.callback = std::bind(m_cb_number, value, _1);
+        pending.valid = true;
+        return pending;
     }
     case PacketDataType::KeyValue: {
         if (!m_cb_keyvalue) {
-            return std::function<void(PacketInfo)>();
+            return pending;
         }
 
-        if (len < 8) {
-            ESP_LOGE(TAG, "invalid keyvalue packet received, got len %d instead >= 8", len);
-            return std::function<void(PacketInfo)>();
+        if (len < sizeof(double)) {
+            ESP_LOGE(TAG, "invalid keyvalue packet received, got len %u instead of >= %u",
+                static_cast<unsigned>(len), static_cast<unsigned>(sizeof(double)));
+            return pending;
         }
 
-        double val = *((double*)data);
-        std::string key((const char*)data + 8, len - 8);
+        double value = 0;
+        std::memcpy(&value, data, sizeof(value));
+        std::string key(reinterpret_cast<const char*>(data + sizeof(double)), len - sizeof(double));
+        pending.callback = std::bind(m_cb_keyvalue, key, value, _1);
+        pending.valid = true;
+        return pending;
+    }
+    case PacketDataType::Blob: {
+        if (!m_cb_blob) {
+            return pending;
+        }
 
-        return std::bind(m_cb_keyvalue, key, val, _1);
+        pending.callback = std::bind(m_cb_blob, std::span<const uint8_t>(data, len), _1);
+        pending.valid = true;
+        return pending;
     }
     default:
-        ESP_LOGE(TAG, "invalid data type received: %d", dtype);
-        return std::function<void(PacketInfo)>();
+        ESP_LOGE(TAG, "invalid data type received: %u", static_cast<unsigned>(dtype));
+        return pending;
     }
 }
 
-void SimpleRadioImpl::setGroup(uint8_t group) {
-    if (group >= 16) {
-        ESP_LOGE(TAG, "The group id must be in range <0;16)");
+void SimpleRadioImpl::onDataReceived(const esp_now_recv_info_t* esp_now_info, const uint8_t* data, int len) {
+    if (esp_now_info == nullptr || esp_now_info->src_addr == nullptr || data == nullptr || len <= 0) {
         return;
     }
 
-    // check if current group (bottom 4 bits of m_data[0]) is same as set one
-    if (group == (m_data[0] & 0x0F)) {
+    auto& self = SimpleRadio;
+    DecodedPacket decoded = {};
+    if (!decodePacket(data, static_cast<size_t>(len), decoded)) {
         return;
     }
 
-    m_data[0] = (m_data[0] & 0xF0) | group;
-    submitAdvertisingData();
-}
+    int16_t rssi = 0;
+    if (esp_now_info->rx_ctrl != nullptr) {
+        rssi = esp_now_info->rx_ctrl->rssi;
+    }
 
-uint8_t SimpleRadioImpl::group() const {
-    return m_data[0] & 0x0F;
-}
+    PendingCallback pending = {};
+    {
+        std::lock_guard<std::mutex> lock(self.m_mutex);
+        if (decoded.group != self.m_group) {
+            return;
+        }
 
-esp_err_t SimpleRadioImpl::address(esp_bd_addr_t out_address) const {
-    uint8_t addr_type;
-    return esp_ble_gap_get_local_used_addr(out_address, &addr_type);
-}
+        if (self.m_ignore_repeated_messages &&
+            self.m_last_incoming_packet.size() == static_cast<size_t>(len) &&
+            std::memcmp(self.m_last_incoming_addr.data(), esp_now_info->src_addr, self.m_last_incoming_addr.size()) == 0 &&
+            std::memcmp(self.m_last_incoming_packet.data(), data, static_cast<size_t>(len)) == 0) {
+            return;
+        }
 
-void SimpleRadioImpl::setData(PacketDataType dtype, const uint8_t* data, size_t len) {
-    if (len == 0) {
-        m_data_size = 0;
+        self.m_last_incoming_packet.assign(data, data + len);
+        std::memcpy(self.m_last_incoming_addr.data(), esp_now_info->src_addr, self.m_last_incoming_addr.size());
+        pending = self.prepareCallbackLocked(decoded.type, decoded.payload, decoded.payload_len);
+    }
+
+    if (!pending.valid) {
         return;
     }
 
-    if (len > 30) {
-        ESP_LOGW(TAG, "The simple radio data can be only 30 bytes long.");
-        len = 30;
-    }
-
-    m_data[0] = (m_data[0] & 0xCF) | ((dtype & 0x3) << 4);
-
-    memcpy(m_data + 1, data, len);
-    m_data_size = len + 1;
-
-    submitAdvertisingData();
-}
-
-void SimpleRadioImpl::submitAdvertisingData() {
-    if (!m_initialized || m_data_size == 0) {
-        return;
-    }
-
-    m_mutex.lock();
-    esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(m_data, m_data_size);
-    if (raw_adv_ret) {
-        ESP_LOGE(TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
-    }
-    m_mutex.unlock();
+    pending.callback(makePacketInfo(esp_now_info->src_addr, decoded.group, rssi));
 }
