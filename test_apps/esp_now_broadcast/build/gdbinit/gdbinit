@@ -1,2 +1,0 @@
-source /home/tom/Projects/Esp32-simple-radio/test_apps/esp_now_broadcast/build/gdbinit/symbols
-source /home/tom/Projects/Esp32-simple-radio/test_apps/esp_now_broadcast/build/gdbinit/connect
