@@ -317,7 +317,7 @@ void SimpleRadioImpl::setData(PacketDataType dtype, const uint8_t* data, size_t 
     }
 }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 void SimpleRadioImpl::onDataSent(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
         return;
