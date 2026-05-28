@@ -317,6 +317,7 @@ void SimpleRadioImpl::setData(PacketDataType dtype, const uint8_t* data, size_t 
     }
 }
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
 void SimpleRadioImpl::onDataSent(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
         return;
@@ -331,6 +332,22 @@ void SimpleRadioImpl::onDataSent(const esp_now_send_info_t* tx_info, esp_now_sen
         tx_info->des_addr[0], tx_info->des_addr[1], tx_info->des_addr[2],
         tx_info->des_addr[3], tx_info->des_addr[4], tx_info->des_addr[5]);
 }
+#else
+void SimpleRadioImpl::onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        return;
+    }
+
+    if (mac_addr == nullptr) {
+        ESP_LOGW(TAG, "ESP-NOW send failed");
+        return;
+    }
+
+    ESP_LOGW(TAG, "ESP-NOW send failed to %02x:%02x:%02x:%02x:%02x:%02x",
+        mac_addr[0], mac_addr[1], mac_addr[2],
+        mac_addr[3], mac_addr[4], mac_addr[5]);
+}
+#endif
 
 SimpleRadioImpl::PendingCallback SimpleRadioImpl::prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len) {
     using namespace std::placeholders;

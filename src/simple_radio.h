@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <esp_err.h>
+#include <esp_idf_version.h>
 #include <esp_now.h>
 #include <functional>
 #include <mutex>
@@ -121,7 +122,11 @@ private:
         bool valid = false;
     };
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
     static void onDataSent(const esp_now_send_info_t* tx_info, esp_now_send_status_t status);
+#else
+    static void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status);
+#endif
     static void onDataReceived(const esp_now_recv_info_t* esp_now_info, const uint8_t* data, int len);
 
     PendingCallback prepareCallbackLocked(PacketDataType dtype, const uint8_t* data, size_t len);
