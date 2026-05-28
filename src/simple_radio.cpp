@@ -101,10 +101,8 @@ const SimpleRadioImpl::Config SimpleRadioImpl::DEFAULT_CONFIG = {
 
 SimpleRadioImpl::SimpleRadioImpl()
     : m_initialized(false),
-      m_ignore_repeated_messages(true),
       m_group(0),
-      m_tx_buffer(kMaxPacketSize, 0),
-      m_last_incoming_addr({0, 0, 0, 0, 0, 0}) {
+      m_tx_buffer(kMaxPacketSize, 0) {
 }
 
 SimpleRadioImpl::~SimpleRadioImpl() {
@@ -273,8 +271,6 @@ void SimpleRadioImpl::end() {
     m_cb_number = nullptr;
     m_cb_keyvalue = nullptr;
     m_cb_blob = nullptr;
-    m_last_incoming_packet.clear();
-    std::fill(m_last_incoming_addr.begin(), m_last_incoming_addr.end(), 0);
 }
 
 void SimpleRadioImpl::setGroup(uint8_t group) {
@@ -438,15 +434,6 @@ void SimpleRadioImpl::onDataReceived(const esp_now_recv_info_t* esp_now_info, co
             return;
         }
 
-        if (self.m_ignore_repeated_messages &&
-            self.m_last_incoming_packet.size() == static_cast<size_t>(len) &&
-            std::memcmp(self.m_last_incoming_addr.data(), esp_now_info->src_addr, self.m_last_incoming_addr.size()) == 0 &&
-            std::memcmp(self.m_last_incoming_packet.data(), data, static_cast<size_t>(len)) == 0) {
-            return;
-        }
-
-        self.m_last_incoming_packet.assign(data, data + len);
-        std::memcpy(self.m_last_incoming_addr.data(), esp_now_info->src_addr, self.m_last_incoming_addr.size());
         pending = self.prepareCallbackLocked(decoded.type, decoded.payload, decoded.payload_len);
     }
 

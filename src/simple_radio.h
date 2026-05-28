@@ -2,7 +2,6 @@
 
 #include "freertos/FreeRTOS.h"
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -91,11 +90,6 @@ public:
         setData(PacketDataType::Blob, data.data(), data.size());
     }
 
-    void setIgnoreRepeatedMessages(bool ignore) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_ignore_repeated_messages = ignore;
-    }
-
     void setOnStringCallback(PacketStringCallbackT cb) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_cb_string = cb;
@@ -139,14 +133,11 @@ private:
     static constexpr size_t kMaxPacketSize = kHeaderSize + kMaxPayloadSize;
 
     std::atomic<bool> m_initialized;
-    bool m_ignore_repeated_messages;
     uint8_t m_group;
 
     Config m_used_config;
 
     std::vector<uint8_t> m_tx_buffer;
-    std::vector<uint8_t> m_last_incoming_packet;
-    std::array<uint8_t, 6> m_last_incoming_addr;
 
     PacketStringCallbackT m_cb_string;
     PacketNumberCallbackT m_cb_number;
