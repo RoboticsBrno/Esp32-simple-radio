@@ -10,13 +10,12 @@ jobs:
         example:
           - examples/basic
         conf:
-          - esp32-idf3-arduino.ini
-          - esp32-idf4-arduino.ini
-          #- esp32-idf5-idf.ini
-          - esp32c3-idf4-arduino.ini
-          #- esp32c3-idf5-idf.ini
-          - esp32s3-idf4-arduino.ini
-          #- esp32s3-idf5-idf.ini
+          - esp32-idf5-idf.ini
+          - esp32c3-idf5-idf.ini
+          - esp32s3-idf5-idf.ini
+          - esp32-idf5-arduino.ini
+          - esp32c3-idf5-arduino.ini
+          - esp32s3-idf5-arduino.ini
     steps:
       - uses: actions/checkout@v3
       - name: Set up Python
@@ -29,3 +28,5 @@ jobs:
         run: platformio ci --lib="." --project-conf="./test-inis/${{ matrix.conf }}"
         env:
           PLATFORMIO_CI_SRC: ${{ matrix.example }}
+          IDF_COMPONENT_MANAGER: "0"
+          IDF_COMPONENT_CHECK_NEW_VERSION: "0"

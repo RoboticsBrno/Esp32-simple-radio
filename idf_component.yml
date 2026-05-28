@@ -1,4 +1,4 @@
-version: "2.0.0"
+version: "2.1.0"
 description: "Simple ESP-NOW broadcast radio for ESP32, inspired by micro:bit radio."
 url: "https://github.com/RoboticsBrno/Esp32-simple-radio"
 repository: "https://github.com/RoboticsBrno/Esp32-simple-radio.git"
